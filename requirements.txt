@@ -14,3 +14,6 @@ httpx>=0.27.0
 
 # Note: Pin exact versions in production for reproducible builds
 # To generate exact versions: pip freeze > requirements.txt
+
+# Video processing
+opencv-python>=4.8.0
