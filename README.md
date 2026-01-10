@@ -20,7 +20,7 @@ Bot client that joins LiveKit rooms to simulate user conversations with the agen
 
 ```bash
 cd bot
-python bot_client.py
+python stress_test_bots.py -n 1
 ```
 
 The bot will:
