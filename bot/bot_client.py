@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from livekit import rtc
 from livekit.agents import AgentSession, RoomInputOptions, RoomOutputOptions
 from livekit.agents.stt import SpeechEventType
+from livekit.agents.vad import VADEventType
 from livekit.plugins import aws, silero
 
 from config import ConfigError, get_optional_config, validate_env_vars
@@ -45,10 +46,21 @@ logger = logging.getLogger(__name__)
 
 # Suppress noisy LiveKit SDK logs (e.g., "ignoring text stream" messages)
 logging.getLogger("livekit").setLevel(logging.WARNING)
+logging.getLogger("root").setLevel(logging.WARNING)
 
 
-async def create_bot_session(bot_number: int | None = None) -> dict:
-    """Call ops-api /v1/livekit/bot to create a bot room and token."""
+async def create_bot_session(
+    bot_number: int | None = None,
+    user_id: str | None = None,
+    bot_id: str | None = None,
+) -> dict:
+    """Call ops-api /bot/create to create a bot room and token.
+    
+    Args:
+        bot_number: If provided, sets preferredIdentity to "bot-{bot_number}".
+        user_id: If provided, uses the real user's identity (e.g., "kakao_123456").
+        bot_id: If provided, joins a specific bot room (e.g., "0" -> room="bot-0").
+    """
     api_base = os.getenv("OPS_API_URL", "http://localhost:8080")
     admin_token = os.getenv("ADMIN_ACCESS_TOKEN")
 
@@ -56,13 +68,24 @@ async def create_bot_session(bot_number: int | None = None) -> dict:
     if admin_token:
         headers["Authorization"] = f"Bearer {admin_token}"
 
-    # Request a shorter identity if bot_number is provided
+    # Build request body
     body = {}
     if bot_number is not None:
         body["preferredIdentity"] = f"bot-{bot_number}"
+        if bot_id is None:
+            body["botId"] = str(bot_number)
+    if user_id is not None:
+        body["userId"] = user_id
+    if bot_id is not None:
+        body["botId"] = bot_id
 
+    url = f"{api_base}/v1/bot/create"
+    print(f"[DEBUG] POST {url}", flush=True)
+    print(f"[DEBUG] Body: {body}", flush=True)
+    
     async with httpx.AsyncClient() as client:
-        resp = await client.post(f"{api_base}/v1/livekit/bot", json=body, headers=headers)
+        resp = await client.post(url, json=body, headers=headers)
+        print(f"[DEBUG] Response status: {resp.status_code}", flush=True)
         resp.raise_for_status()
         return resp.json()
 
@@ -72,11 +95,16 @@ class SimpleBotAgent:
 
     def __init__(self):
         self.conversation_count = 0
+        # Elderly Korean speech patterns with informal/반말 style
         self.responses = [
-            "네, 잘 지내고 있어요. 오늘 날씨가 좋네요.",
-            "그렇군요. 요즘 건강은 어떠세요?",
-            "네, 알겠습니다. 감사합니다.",
-            "좋은 하루 보내세요!",
+            "응, 그래 그래. 요즘 허리가 좀 아프긴 해도 잘 지내고 있어.",
+            "아이고, 그러게 말이야. 나이 먹으니까 여기저기 안 아픈 데가 없어.",
+            "뭐라고? 아, 그래그래. 요즘 귀가 좀 어두워져서 말이야.",
+            "그래, 고맙다 고마워. 젊은 사람이 이렇게 챙겨주니 좋구만.",
+            "옛날에는 말이야, 이런 거 없었어. 세상 참 좋아졌어.",
+            "아이고, 맞아 맞아. 요즘 젊은 것들은 바빠서 연락도 잘 안 해.",
+            "밥은 먹었어? 끼니는 잘 챙겨 먹어야 해.",
+            "그래, 알았어 알았어. 뭐 더 할 말 있어?",
         ]
 
     def get_response(self, agent_said: str) -> str:
@@ -181,9 +209,10 @@ async def publish_video_from_file(room: rtc.Room, bot_number: int):
 async def run_bot() -> None:
     # Get bot number from environment (set by stress_test_bots.py)
     bot_number = int(os.getenv("BOT_NUMBER", "1"))
+    user_id = os.getenv("USER_ID")  # Optional: use real user's identity
 
     # Step 1: ask ops-api to create a bot session and dispatch the voice agent
-    bot_session = await create_bot_session(bot_number)
+    bot_session = await create_bot_session(bot_number, user_id=user_id)
 
     livekit_url = bot_session["livekitUrl"]
     token = bot_session["token"]
@@ -195,7 +224,6 @@ async def run_bot() -> None:
     # Step 2: connect to LiveKit as the bot-* participant
     room = rtc.Room()
     await room.connect(livekit_url, token)
-    # Silenced verbose connection log
 
     # Initialize STT, TTS, and VAD for two-way communication
     stt = aws.STT(language="ko-KR")
@@ -216,6 +244,8 @@ async def run_bot() -> None:
     speak_lock = asyncio.Lock()
     # Flag to indicate bot is speaking (pause STT processing)
     is_speaking = False
+    # Flag to track if initial greeting has been sent
+    initial_greeting_sent = False
 
     # Helper function to speak via TTS
     async def speak(text: str):
@@ -239,39 +269,65 @@ async def run_bot() -> None:
         audio_stream = rtc.AudioStream(track)
         stt_stream = stt.stream()
         frame_count = 0
+        
+        # Accumulated text and response task for debounce
+        accumulated_text = []
+        response_task = None
 
-        # Task to read transcripts
+        # Task to read transcripts with debounce
         async def read_transcripts():
-            # Silenced STT reader log
+            nonlocal initial_greeting_sent, response_task
+            
+            async def delayed_response():
+                """Wait for silence, then wait for TTS to finish playing, then respond."""
+                await asyncio.sleep(2.0)  # Wait 2 seconds of silence (no new transcripts)
+                if accumulated_text and not is_speaking:
+                    full_text = " ".join(accumulated_text)
+                    accumulated_text.clear()
+                    
+                    # Estimate TTS playback duration: ~100ms per character for Korean
+                    estimated_tts_duration = len(full_text) * 0.1
+                    print(f"[BOT] Agent finished generating: {full_text}", flush=True)
+                    print(f"[BOT] Waiting {estimated_tts_duration:.1f}s for TTS playback to finish...", flush=True)
+                    await asyncio.sleep(estimated_tts_duration)
+                    
+                    nonlocal initial_greeting_sent
+                    if not initial_greeting_sent:
+                        initial_greeting_sent = True
+                        print(f"[BOT] bot {bot_number} 시작", flush=True)
+                    
+                    # Wait 3 seconds to allow data packets to reach web UI
+                    await asyncio.sleep(3)
+                    
+                    response = bot_agent.get_response(full_text)
+                    await speak(response)
+            
             try:
                 async for event in stt_stream:
-                    # Silenced STT event details
-                    # Check for final transcript
                     if event.type == SpeechEventType.FINAL_TRANSCRIPT and event.alternatives:
                         transcript = event.alternatives[0].text
                         if transcript and transcript.strip():
                             print(f"[BOT] Agent said: {transcript}", flush=True)
-                            # Generate and speak response
-                            response = bot_agent.get_response(transcript)
-                            await speak(response)
+                            accumulated_text.append(transcript.strip())
+                            
+                            # Cancel previous timer and start new one
+                            if response_task and not response_task.done():
+                                response_task.cancel()
+                            response_task = asyncio.create_task(delayed_response())
             except Exception as e:
                 logger.error(f"Error in transcript reader: {e}", exc_info=True)
-            # Silenced STT reader ended log
 
         transcript_task = asyncio.create_task(read_transcripts())
 
-        # Feed audio to STT (skip frames while bot is speaking to avoid echo)
+        # Feed audio to STT
         try:
             async for frame_event in audio_stream:
                 frame_count += 1
-                # Silenced frame count logging
-                # Only process audio when bot is NOT speaking
                 if not is_speaking:
                     stt_stream.push_frame(frame_event.frame)
         except Exception as e:
             logger.error(f"Error reading audio stream: {e}")
 
-        # Silenced audio stream ended log
         await stt_stream.aclose()
         await transcript_task
 
@@ -329,11 +385,6 @@ async def run_bot() -> None:
 
     # Start video publishing in background
     video_task = asyncio.create_task(publish_video_from_file(room, bot_number))
-
-    # Send initial greeting to start the conversation
-    await asyncio.sleep(1)  # Give agent time to subscribe to our track
-    print(f"[BOT] Speaking: 안녕하세요, 저는 테스트 봇입니다. 잘 들리시나요?", flush=True)
-    await speak("안녕하세요, 저는 테스트 봇입니다. 잘 들리시나요?")
 
     # Keep the bot connected until interrupted
     try:
