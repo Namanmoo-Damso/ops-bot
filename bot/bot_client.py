@@ -119,9 +119,10 @@ async def publish_video_from_file(room: rtc.Room, bot_number: int):
     """Publish video from a file, looping continuously in 9:16 portrait format."""
     import cv2
 
-    # Video file path - look for video-1.mp4 in the video folder
+    # Video file path - rotate through bot1.mp4, bot2.mp4, bot3.mp4, bot4.mp4
     video_dir = Path(__file__).parent.parent / "video"
-    video_path = video_dir / "video-1.mp4"
+    video_index = ((bot_number - 1) % 4) + 1  # Rotate 1-4 based on bot number
+    video_path = video_dir / f"bot{video_index}.mp4"
 
     if not video_path.exists():
         print(f"[BOT] ERROR: Video file not found: {video_path}", flush=True)
