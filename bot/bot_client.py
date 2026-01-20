@@ -22,6 +22,36 @@ from livekit.plugins import aws, silero
 from config import ConfigError, get_optional_config, validate_env_vars
 
 
+# Female video indices (1, 2, 4) and male video index (3)
+FEMALE_VIDEOS = [1, 2, 4]
+MALE_VIDEO = 3
+
+
+def get_video_for_bot(bot_number: int) -> int:
+    """Get video index for a bot based on its number.
+    
+    Bot 1-25: Female (randomly picks from videos 1, 2, 4)
+    Bot 26-50: Male (video 3)
+    Cycles every 50 bots.
+    
+    Returns:
+        video_index (1, 2, 3, or 4)
+    """
+    import random
+    # Use bot_number as seed for reproducibility
+    rng = random.Random(bot_number)
+    
+    # Cycle every 50 bots: 1-25 female, 26-50 male
+    position = ((bot_number - 1) % 50) + 1
+    
+    if position <= 25:
+        # Female - randomly pick from videos 1, 2, 4
+        return rng.choice(FEMALE_VIDEOS)
+    else:
+        # Male - video 3
+        return MALE_VIDEO
+
+
 # Load environment variables from ../.env if present
 # Load environment variables
 env_path = Path(__file__).parent / ".env"
@@ -96,15 +126,75 @@ class SimpleBotAgent:
     def __init__(self):
         self.conversation_count = 0
         # Elderly Korean speech patterns with informal/반말 style
+        # Covers: greetings, health, daily life, emotions, family, weather, food, memories
         self.responses = [
+            # 일상 인사/안부 응답
             "응, 그래 그래. 요즘 허리가 좀 아프긴 해도 잘 지내고 있어.",
+            "아이고, 덕분에 잘 지내지. 고마워.",
+            "뭐, 그럭저럭 살고 있어. 하루하루가 다 비슷하지 뭐.",
+            "응, 오늘은 좀 괜찮아. 어제보다 낫네.",
+            
+            # 건강 관련 응답
             "아이고, 그러게 말이야. 나이 먹으니까 여기저기 안 아픈 데가 없어.",
-            "뭐라고? 아, 그래그래. 요즘 귀가 좀 어두워져서 말이야.",
-            "그래, 고맙다 고마워. 젊은 사람이 이렇게 챙겨주니 좋구만.",
-            "옛날에는 말이야, 이런 거 없었어. 세상 참 좋아졌어.",
-            "아이고, 맞아 맞아. 요즘 젊은 것들은 바빠서 연락도 잘 안 해.",
+            "무릎이 좀 시큰시큰해. 비가 오려나 봐.",
+            "오늘은 혈압이 좀 높은 것 같아. 조심해야겠어.",
+            "허리가 아파서 오래 못 앉아 있겠어.",
+            "눈이 침침해서 글씨가 잘 안 보여.",
+            "아이고, 다리에 힘이 없어서 오래 못 걸어.",
+            "요즘 잠을 잘 못 자. 새벽에 자꾸 깨.",
+            
+            # 식사/음식 관련 응답
             "밥은 먹었어? 끼니는 잘 챙겨 먹어야 해.",
-            "그래, 알았어 알았어. 뭐 더 할 말 있어?",
+            "오늘 아침에 죽 끓여 먹었어. 속이 편하더라고.",
+            "점심은 된장찌개 끓여 먹었어. 맛있었어.",
+            "배가 좀 고프네... 뭐 먹을까.",
+            "요즘은 입맛이 없어서 많이 못 먹어.",
+            "옛날에는 밥을 세 공기씩 먹었는데, 이제는 반 공기도 힘들어.",
+            
+            # 귀가 어두움/다시 말해달라
+            "뭐라고? 아, 그래그래. 요즘 귀가 좀 어두워져서 말이야.",
+            "뭐라고 했어? 좀 크게 말해줘.",
+            "아, 그래? 뭐라고? 다시 한번 말해봐.",
+            "귀가 어두워서... 천천히 다시 말해줄래?",
+            
+            # 감사/긍정 응답
+            "그래, 고맙다 고마워. 젊은 사람이 이렇게 챙겨주니 좋구만.",
+            "아이고, 고마워라. 네가 말 걸어주니까 덜 외롭네.",
+            "그래그래, 좋아. 고맙다.",
+            "참 착하구나. 이렇게 신경 써줘서 고마워.",
+            
+            # 옛날 이야기/추억
+            "옛날에는 말이야, 이런 거 없었어. 세상 참 좋아졌어.",
+            "우리 젊었을 때는 말이야, 많이 힘들었어.",
+            "내가 젊었을 때는 산에 나무하러 많이 다녔지.",
+            "옛날 생각이 나네... 그때가 좋았어.",
+            "우리 신랑이 살아있을 때는 같이 산책 많이 다녔는데...",
+            
+            # 자녀/손주 이야기
+            "아이고, 맞아 맞아. 요즘 젊은 것들은 바빠서 연락도 잘 안 해.",
+            "우리 아들이 요즘 바쁜가 봐. 전화가 안 오네.",
+            "손자가 어제 전화했어. 반갑더라고.",
+            "우리 며느리가 잘해줘. 고맙지.",
+            "손녀가 대학 갔어. 기특하지?",
+            "자식들이 다 커서 제 앞가림 하니까 다행이야.",
+            
+            # 날씨/계절 관련
+            "오늘 날씨가 좋네. 산책이라도 나가볼까.",
+            "비가 올 것 같아. 빨래 걷어야겠다.",
+            "요즘 날이 추워서 바깥에 못 나가.",
+            "봄이 오나 봐. 꽃이 피기 시작했어.",
+            
+            # 일상 활동 응답
+            "오늘 아침에 산책 좀 했어. 기분이 좋더라.",
+            "텔레비전 보고 있었어. 드라마가 재밌어.",
+            "아까 화분에 물 줬어. 꽃이 예쁘게 피었어.",
+            "이웃집 아주머니랑 얘기 좀 하고 왔어.",
+            
+            # 감정 표현
+            "아이고, 심심해. 말동무가 없으니까.",
+            "오늘은 기분이 좋아. 날씨도 좋고.",
+            "좀 우울해... 아무것도 하기 싫어.",
+            "외로울 때가 있어. 혼자 있으니까.",
         ]
 
     def get_response(self, agent_said: str) -> str:
@@ -119,9 +209,9 @@ async def publish_video_from_file(room: rtc.Room, bot_number: int):
     """Publish video from a file, looping continuously in 9:16 portrait format."""
     import cv2
 
-    # Video file path - rotate through bot1.mp4, bot2.mp4, bot3.mp4, bot4.mp4
+    # Video file path - select based on gender (1-25=female, 26-50=male)
     video_dir = Path(__file__).parent.parent / "video"
-    video_index = ((bot_number - 1) % 4) + 1  # Rotate 1-4 based on bot number
+    video_index = get_video_for_bot(bot_number)
     video_path = video_dir / f"bot{video_index}.mp4"
 
     if not video_path.exists():
@@ -137,12 +227,12 @@ async def publish_video_from_file(room: rtc.Room, bot_number: int):
 
     src_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     src_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    fps = 60
     cap.release()
 
     # Target: 9:16 portrait aspect ratio (matching the UI)
-    target_width = 720
-    target_height = 1280
+    target_width = 1080
+    target_height = 1920
     target_aspect = target_width / target_height  # 0.5625
 
     print(f"[BOT] Source video: {src_width}x{src_height}, Target: {target_width}x{target_height} (9:16 portrait)", flush=True)
@@ -211,14 +301,40 @@ async def run_bot() -> None:
     # Get bot number from environment (set by stress_test_bots.py)
     bot_number = int(os.getenv("BOT_NUMBER", "1"))
     user_id = os.getenv("USER_ID")  # Optional: use real user's identity
+    api_base = os.getenv("OPS_API_URL", "http://localhost:8080")
 
     # Step 1: ask ops-api to create a bot session and dispatch the voice agent
     bot_session = await create_bot_session(bot_number, user_id=user_id)
 
+    # Handle queue response - poll until ready
+    if bot_session.get("status") == "queued":
+        identity = bot_session["identity"]
+        room_name = bot_session["roomName"]
+        position = bot_session.get("position", "?")
+        print(f"[BOT] Queued at position {position}, polling...", flush=True)
+        
+        async with httpx.AsyncClient() as client:
+            while True:
+                retry_after = bot_session.get("retryAfter", 5)
+                await asyncio.sleep(retry_after)
+                
+                queue_resp = await client.get(
+                    f"{api_base}/v1/rtc/queue/{identity}",
+                    params={"roomName": room_name}
+                )
+                bot_session = queue_resp.json()
+                
+                if bot_session.get("status") == "ready":
+                    print(f"[BOT] Queue cleared, got token!", flush=True)
+                    break
+                    
+                new_position = bot_session.get("position", "?")
+                print(f"[BOT] Still queued at position {new_position}", flush=True)
+
     livekit_url = bot_session["livekitUrl"]
     token = bot_session["token"]
-    room_name = bot_session["roomName"]
-    identity = bot_session["identity"]
+    room_name = bot_session.get("roomName") or bot_session.get("room_name")
+    identity = bot_session.get("identity")
 
     print(f"[BOT] Joined room={room_name} identity={identity}", flush=True)
 

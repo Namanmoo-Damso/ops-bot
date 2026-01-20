@@ -15,6 +15,14 @@ import os
 import signal
 
 
+def get_user_id_for_bot(bot_number: int) -> str:
+    """Generate dummy user ID for a bot.
+    
+    Format: 10000000-0000-0000-0000-000000000001 to 000000000100
+    """
+    return f"10000000-0000-0000-0000-{bot_number:012d}"
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Spawn multiple bot instances for stress testing")
     parser.add_argument(
@@ -47,10 +55,12 @@ def main():
 
     try:
         for i in range(1, total_bots + 1):
-            print(f"[{time.strftime('%H:%M:%S')}] Starting bot {i}/{total_bots}...", flush=True)
-            # Pass bot number as environment variable
+            user_id = get_user_id_for_bot(i)
+            print(f"[{time.strftime('%H:%M:%S')}] Starting bot {i}/{total_bots} (userId={user_id})...", flush=True)
+            # Pass bot number and user ID as environment variables
             bot_env = os.environ.copy()
             bot_env["BOT_NUMBER"] = str(i)
+            bot_env["USER_ID"] = user_id
             proc = subprocess.Popen(
                 [sys.executable, "bot_client.py"],
                 # Let bot output go to console
