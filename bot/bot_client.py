@@ -22,6 +22,21 @@ from livekit.plugins import aws, silero
 from config import ConfigError, get_optional_config, validate_env_vars
 
 
+# Global shared VAD model - loaded once, reused by all bots in this process
+_shared_vad: silero.VAD | None = None
+
+def get_shared_vad() -> silero.VAD:
+    """Get or create shared VAD model (saves ~50MB per bot)."""
+    global _shared_vad
+    if _shared_vad is None:
+        _shared_vad = silero.VAD.load(
+            min_speech_duration=0.3,
+            min_silence_duration=1.0,
+            activation_threshold=0.7,
+        )
+    return _shared_vad
+
+
 # Female video indices (1, 2, 4) and male video index (3)
 FEMALE_VIDEOS = [1, 2, 4]
 MALE_VIDEO = 3
@@ -37,6 +52,10 @@ def get_video_for_bot(bot_number: int) -> int:
     Returns:
         video_index (1, 2, 3, or 4)
     """
+    # If single video mode, always use video 1
+    if os.getenv("SINGLE_VIDEO"):
+        return 1
+    
     import random
     # Use bot_number as seed for reproducibility
     rng = random.Random(bot_number)
@@ -227,12 +246,18 @@ async def publish_video_from_file(room: rtc.Room, bot_number: int):
     print(f"[BOT] Video track published from shared broadcaster: video{video_index} @ {FPS}fps -> {TARGET_WIDTH}x{TARGET_HEIGHT} (I420)", flush=True)
 
     frame_interval = 1 / FPS
+    next_frame_time = asyncio.get_event_loop().time()
 
     try:
         while True:
+            current_time = asyncio.get_event_loop().time()
+            
+            # Skip frames if we're behind schedule (prevents CPU buildup)
+            if current_time < next_frame_time:
+                await asyncio.sleep(next_frame_time - current_time)
+            
             frame_bytes = frame_reader.get_frame_bytes()
             if frame_bytes:
-                # Use I420 format - more efficient, less CPU for encoding
                 video_frame = rtc.VideoFrame(
                     width=TARGET_WIDTH,
                     height=TARGET_HEIGHT,
@@ -240,7 +265,12 @@ async def publish_video_from_file(room: rtc.Room, bot_number: int):
                     data=frame_bytes,
                 )
                 video_source.capture_frame(video_frame)
-            await asyncio.sleep(frame_interval)
+            
+            next_frame_time += frame_interval
+            
+            # If we're way behind, reset timing (prevents runaway catch-up)
+            if current_time - next_frame_time > 1.0:
+                next_frame_time = current_time + frame_interval
     finally:
         frame_reader.close()
 
@@ -291,14 +321,10 @@ async def run_bot() -> None:
     room = rtc.Room()
     await room.connect(livekit_url, token)
 
-    # Initialize STT, TTS, and VAD for two-way communication
+    # Initialize STT, TTS (VAD is shared globally to save memory)
     stt = aws.STT(language="ko-KR")
     tts = aws.TTS(voice="Seoyeon", sample_rate=24000)
-    vad = silero.VAD.load(
-        min_speech_duration=0.3,
-        min_silence_duration=1.0,
-        activation_threshold=0.7,
-    )
+    vad = get_shared_vad()  # Reuse shared model instead of loading new one
 
     bot_agent = SimpleBotAgent()
 
@@ -449,8 +475,12 @@ async def run_bot() -> None:
 
     print(f"[BOT] Ready and listening for agent speech...", flush=True)
 
-    # Start video publishing in background
-    video_task = asyncio.create_task(publish_video_from_file(room, bot_number))
+    # Start video publishing in background (unless disabled)
+    video_task = None
+    if not os.getenv("NO_VIDEO"):
+        video_task = asyncio.create_task(publish_video_from_file(room, bot_number))
+    else:
+        print(f"[BOT] Video disabled (NO_VIDEO=1)", flush=True)
 
     # Keep the bot connected until interrupted
     try:

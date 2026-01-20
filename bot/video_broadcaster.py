@@ -3,20 +3,24 @@ Shared video frame broadcaster using shared memory.
 One broadcaster per video file, multiple bots can read the current frame.
 
 Uses I420 (YUV) format for efficiency - 1.5 bytes/pixel vs 3 bytes/pixel for RGB.
+
+Supports two modes:
+1. Preprocessed numpy files (fast, low CPU) - use preprocess_videos.py first
+2. Real-time video decoding (fallback if numpy not found)
 """
 import multiprocessing as mp
 from multiprocessing import shared_memory
 from pathlib import Path
 from typing import Optional
 import numpy as np
-import cv2
 import time
 
-# Target resolution - HD quality for iPhone
-TARGET_WIDTH = 1080
-TARGET_HEIGHT = 1920
+# Target resolution - 360p @ 20fps for stress testing
+# For production, consider 720x1280 @ 24fps
+TARGET_WIDTH = 360
+TARGET_HEIGHT = 640
 TARGET_ASPECT = TARGET_WIDTH / TARGET_HEIGHT
-FPS = 30  # 30fps for CPU efficiency (still smooth on iPhone)
+FPS = 20  # 20fps for smoother video
 
 # I420 format: Y plane (full res) + U plane (half res) + V plane (half res)
 # Total size = width * height * 1.5
@@ -35,44 +39,90 @@ class VideoBroadcaster:
         self.shm: Optional[shared_memory.SharedMemory] = None
         self.running = False
 
-    def _crop_and_resize(self, frame: np.ndarray) -> np.ndarray:
-        """Crop center and resize frame to 9:16 portrait aspect ratio."""
-        h, w = frame.shape[:2]
-        src_aspect = w / h
-
-        if src_aspect > TARGET_ASPECT:
-            new_w = int(h * TARGET_ASPECT)
-            start_x = (w - new_w) // 2
-            cropped = frame[:, start_x:start_x + new_w]
-        else:
-            new_h = int(w / TARGET_ASPECT)
-            start_y = (h - new_h) // 2
-            cropped = frame[start_y:start_y + new_h, :]
-
-        # Use INTER_NEAREST for faster resizing (less CPU)
-        resized = cv2.resize(cropped, (TARGET_WIDTH, TARGET_HEIGHT), interpolation=cv2.INTER_NEAREST)
-        return resized
+    def _load_preprocessed(self) -> Optional[np.ndarray]:
+        """Try to load preprocessed numpy frames."""
+        video_dir = Path(__file__).parent.parent / "video"
+        npy_path = video_dir / f"bot{self.video_index}_{TARGET_WIDTH}x{TARGET_HEIGHT}_{FPS}fps.npy"
+        
+        if npy_path.exists():
+            print(f"[BROADCASTER {self.video_index}] Loading preprocessed: {npy_path.name}")
+            frames = np.load(npy_path, mmap_mode='r')  # Memory-map for efficiency
+            print(f"[BROADCASTER {self.video_index}] Loaded {len(frames)} frames")
+            return frames
+        return None
 
     def start(self):
         """Start broadcasting video frames to shared memory."""
-        video_dir = Path(__file__).parent.parent / "video"
-        video_path = video_dir / f"bot{self.video_index}.mp4"
+        # Try preprocessed numpy first
+        preprocessed_frames = self._load_preprocessed()
+        
+        if preprocessed_frames is not None:
+            self._start_from_numpy(preprocessed_frames)
+        else:
+            self._start_from_video()
 
-        if not video_path.exists():
-            print(f"[BROADCASTER {self.video_index}] ERROR: Video not found: {video_path}")
-            return
-
-        # Create shared memory for the frame (I420 format)
+    def _start_from_numpy(self, frames: np.ndarray):
+        """Broadcast from preprocessed numpy array (fast path)."""
+        # Create shared memory for the frame
         try:
             self.shm = shared_memory.SharedMemory(name=self.shm_name, create=True, size=FRAME_SIZE)
         except FileExistsError:
-            # Already exists, attach to it and recreate
             existing = shared_memory.SharedMemory(name=self.shm_name)
             existing.close()
             existing.unlink()
             self.shm = shared_memory.SharedMemory(name=self.shm_name, create=True, size=FRAME_SIZE)
 
-        print(f"[BROADCASTER {self.video_index}] Started: {video_path.name} -> {TARGET_WIDTH}x{TARGET_HEIGHT} @ {FPS}fps (I420)")
+        print(f"[BROADCASTER {self.video_index}] Started (numpy): {TARGET_WIDTH}x{TARGET_HEIGHT} @ {FPS}fps")
+
+        self.running = True
+        frame_interval = 1 / FPS
+        num_frames = len(frames)
+        frame_idx = 0
+        shm_array = np.ndarray(FRAME_SIZE, dtype=np.uint8, buffer=self.shm.buf)
+
+        while self.running:
+            start_time = time.monotonic()
+
+            # Copy frame to shared memory (very fast - just memcpy)
+            np.copyto(shm_array, frames[frame_idx])
+            
+            frame_idx = (frame_idx + 1) % num_frames
+            
+            # Log loop point
+            if frame_idx == 0:
+                print(f"[BROADCASTER {self.video_index}] Video looped")
+
+            # Maintain frame rate
+            elapsed = time.monotonic() - start_time
+            sleep_time = frame_interval - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+        self.cleanup()
+
+    def _start_from_video(self):
+        """Broadcast from video file with real-time decoding (fallback)."""
+        import cv2
+        
+        video_dir = Path(__file__).parent.parent / "video"
+        video_path = video_dir / f"bot{self.video_index}.mp4"
+
+        if not video_path.exists():
+            print(f"[BROADCASTER {self.video_index}] ERROR: Video not found: {video_path}")
+            print(f"[BROADCASTER {self.video_index}] Run: python preprocess_videos.py")
+            return
+
+        # Create shared memory
+        try:
+            self.shm = shared_memory.SharedMemory(name=self.shm_name, create=True, size=FRAME_SIZE)
+        except FileExistsError:
+            existing = shared_memory.SharedMemory(name=self.shm_name)
+            existing.close()
+            existing.unlink()
+            self.shm = shared_memory.SharedMemory(name=self.shm_name, create=True, size=FRAME_SIZE)
+
+        print(f"[BROADCASTER {self.video_index}] Started (video decode): {video_path.name} -> {TARGET_WIDTH}x{TARGET_HEIGHT} @ {FPS}fps")
+        print(f"[BROADCASTER {self.video_index}] TIP: Run 'python preprocess_videos.py' for lower CPU usage")
 
         self.running = True
         frame_interval = 1 / FPS
@@ -91,17 +141,14 @@ class VideoBroadcaster:
                     break  # End of video, loop
 
                 # Process frame: crop, resize, convert to I420
-                frame_portrait = self._crop_and_resize(frame)
-                # BGR -> YUV I420 (this is what video codecs use internally)
+                frame_portrait = self._crop_and_resize(frame, cv2)
                 frame_i420 = cv2.cvtColor(frame_portrait, cv2.COLOR_BGR2YUV_I420)
 
-                # Write I420 frame to shared memory (it's already a flat buffer)
                 np.copyto(
                     np.ndarray(FRAME_SIZE, dtype=np.uint8, buffer=self.shm.buf),
                     frame_i420.flatten()
                 )
 
-                # Maintain frame rate
                 elapsed = time.monotonic() - start_time
                 sleep_time = frame_interval - elapsed
                 if sleep_time > 0:
@@ -109,6 +156,25 @@ class VideoBroadcaster:
 
             cap.release()
             print(f"[BROADCASTER {self.video_index}] Video looped")
+
+        self.cleanup()
+
+    def _crop_and_resize(self, frame: np.ndarray, cv2) -> np.ndarray:
+        """Crop center and resize frame to target aspect ratio."""
+        h, w = frame.shape[:2]
+        src_aspect = w / h
+
+        if src_aspect > TARGET_ASPECT:
+            new_w = int(h * TARGET_ASPECT)
+            start_x = (w - new_w) // 2
+            cropped = frame[:, start_x:start_x + new_w]
+        else:
+            new_h = int(w / TARGET_ASPECT)
+            start_y = (h - new_h) // 2
+            cropped = frame[start_y:start_y + new_h, :]
+
+        resized = cv2.resize(cropped, (TARGET_WIDTH, TARGET_HEIGHT), interpolation=cv2.INTER_AREA)
+        return resized
 
         self.cleanup()
 
@@ -150,14 +216,20 @@ class SharedFrameReader:
         print(f"[FRAME_READER] Failed to connect to {self.shm_name} after {max_retries} attempts")
         return False
 
-    def get_frame_bytes(self) -> Optional[bytes]:
-        """Get current I420 frame as bytes for LiveKit."""
+    def get_frame_bytes(self) -> Optional[bytearray]:
+        """Get current I420 frame as bytes for LiveKit.
+        
+        Returns a bytearray to avoid creating new bytes objects each call.
+        """
         if not self.connected or not self.shm:
             return None
 
         # Read I420 frame directly from shared memory
-        # Use memoryview to avoid extra copy
-        return bytes(self.shm.buf[:FRAME_SIZE])
+        # Use bytearray for better memory efficiency (reusable buffer)
+        if not hasattr(self, '_frame_buffer'):
+            self._frame_buffer = bytearray(FRAME_SIZE)
+        self._frame_buffer[:] = self.shm.buf[:FRAME_SIZE]
+        return self._frame_buffer
 
     def close(self):
         """Close the shared memory connection."""

@@ -42,15 +42,37 @@ def parse_args():
         default=1,
         help="Seconds between spawning each bot (default: 1)"
     )
+    parser.add_argument(
+        "--monitor",
+        action="store_true",
+        help="Enable resource monitoring (prints CPU/RAM usage periodically)"
+    )
+    parser.add_argument(
+        "--no-video",
+        action="store_true",
+        help="Disable video publishing (audio only) for higher bot density"
+    )
+    parser.add_argument(
+        "--single-video",
+        action="store_true",
+        help="Use only 1 shared video (video 1) for all bots to reduce broadcaster CPU"
+    )
     return parser.parse_args()
 
 
-def start_video_broadcasters():
+def start_video_broadcasters(single_video: bool = False):
     """Start shared video broadcaster processes for all video files."""
     from video_broadcaster import start_broadcaster
 
-    print(f"[{time.strftime('%H:%M:%S')}] Starting video broadcasters for videos: {ALL_VIDEO_INDICES}", flush=True)
-    for video_index in ALL_VIDEO_INDICES:
+    if single_video:
+        # Only start broadcaster for video 1 (all bots will use it)
+        video_indices = [1]
+        print(f"[{time.strftime('%H:%M:%S')}] Starting SINGLE video broadcaster (video 1 only)", flush=True)
+    else:
+        video_indices = ALL_VIDEO_INDICES
+        print(f"[{time.strftime('%H:%M:%S')}] Starting video broadcasters for videos: {video_indices}", flush=True)
+    
+    for video_index in video_indices:
         start_broadcaster(video_index)
 
     # Give broadcasters time to initialize shared memory
@@ -63,15 +85,19 @@ def main():
     args = parse_args()
     total_bots = args.num_bots
     spawn_interval = args.interval
+    enable_monitor = args.monitor
 
     # Ensure we are in the correct directory
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
     print(f"Will spawn {total_bots} bots with {spawn_interval}s intervals.", flush=True)
+    if args.no_video:
+        print("Video disabled (--no-video mode).", flush=True)
     print("Press Ctrl+C to stop all bots.\n", flush=True)
 
-    # Start shared video broadcasters (one per video file)
-    start_video_broadcasters()
+    # Start shared video broadcasters (one per video file) - skip if no-video mode
+    if not args.no_video:
+        start_video_broadcasters(single_video=args.single_video)
 
     processes = []
 
@@ -83,6 +109,10 @@ def main():
             bot_env = os.environ.copy()
             bot_env["BOT_NUMBER"] = str(i)
             bot_env["USER_ID"] = user_id
+            if args.no_video:
+                bot_env["NO_VIDEO"] = "1"
+            if args.single_video:
+                bot_env["SINGLE_VIDEO"] = "1"
             proc = subprocess.Popen(
                 [sys.executable, "bot_client.py"],
                 # Let bot output go to console
@@ -101,9 +131,36 @@ def main():
         print(f"\n[{time.strftime('%H:%M:%S')}] All {total_bots} bots are running.", flush=True)
         print("Press Ctrl+C to stop all bots.\n", flush=True)
 
-        # Wait indefinitely until interrupted
-        while True:
-            time.sleep(1)
+        # Wait indefinitely until interrupted, with optional monitoring
+        if enable_monitor:
+            import psutil
+            while True:
+                # Collect stats for all bot processes
+                total_cpu = 0.0
+                total_mem_mb = 0.0
+                alive_count = 0
+                for proc in processes:
+                    if proc.poll() is None:
+                        try:
+                            p = psutil.Process(proc.pid)
+                            total_cpu += p.cpu_percent(interval=0.1)
+                            total_mem_mb += p.memory_info().rss / (1024 * 1024)
+                            alive_count += 1
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            pass
+                
+                # System-wide stats
+                sys_cpu = psutil.cpu_percent()
+                sys_mem = psutil.virtual_memory()
+                
+                print(f"[{time.strftime('%H:%M:%S')}] MONITOR: {alive_count} bots | "
+                      f"Bot CPU: {total_cpu:.1f}% | Bot RAM: {total_mem_mb:.0f}MB | "
+                      f"System CPU: {sys_cpu:.1f}% | System RAM: {sys_mem.percent:.1f}% "
+                      f"({sys_mem.available // (1024*1024)}MB free)", flush=True)
+                time.sleep(10)
+        else:
+            while True:
+                time.sleep(1)
 
     except KeyboardInterrupt:
         print(f"\n[{time.strftime('%H:%M:%S')}] Caught Ctrl+C. Shutting down all bots...", flush=True)
@@ -128,10 +185,11 @@ def main():
         for proc in processes:
             proc.wait()
 
-        # Stop video broadcasters
-        from video_broadcaster import stop_all_broadcasters
-        print(f"[{time.strftime('%H:%M:%S')}] Stopping video broadcasters...", flush=True)
-        stop_all_broadcasters()
+        # Stop video broadcasters (if they were started)
+        if not args.no_video:
+            from video_broadcaster import stop_all_broadcasters
+            print(f"[{time.strftime('%H:%M:%S')}] Stopping video broadcasters...", flush=True)
+            stop_all_broadcasters()
 
         print(f"[{time.strftime('%H:%M:%S')}] All bots stopped.", flush=True)
 

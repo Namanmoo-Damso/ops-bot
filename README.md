@@ -49,3 +49,8 @@ python stress_test_bots.py -n 1
 2. LiveKit 룸에 참가자로 입장
 3. 한국어로 초기 인사말 전송
 4. 에이전트의 음성을 듣고 미리 정의된 문구로 응답
+
+
+추가 다운로드 - EC2 instance용 
+sudo apt-get update
+sudo apt-get install -y ffmpeg libsm6 libxext6 libgl1
