@@ -206,94 +206,43 @@ class SimpleBotAgent:
 
 
 async def publish_video_from_file(room: rtc.Room, bot_number: int):
-    """Publish video from a file, looping continuously in 9:16 portrait format."""
-    import cv2
+    """Publish video frames from shared memory broadcaster using I420 format."""
+    from video_broadcaster import SharedFrameReader, TARGET_WIDTH, TARGET_HEIGHT, FPS
 
-    # Video file path - select based on gender (1-25=female, 26-50=male)
-    video_dir = Path(__file__).parent.parent / "video"
     video_index = get_video_for_bot(bot_number)
-    video_path = video_dir / f"bot{video_index}.mp4"
 
-    if not video_path.exists():
-        print(f"[BOT] ERROR: Video file not found: {video_path}", flush=True)
-        print(f"[BOT] Please add a video file at: {video_path}", flush=True)
+    # Connect to shared frame broadcaster
+    frame_reader = SharedFrameReader(video_index)
+    if not frame_reader.connect(max_retries=30, retry_delay=1.0):
+        print(f"[BOT] ERROR: Could not connect to video broadcaster for video {video_index}", flush=True)
         return
-
-    # Open video to get properties
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        print(f"[BOT] ERROR: Could not open video: {video_path}", flush=True)
-        return
-
-    src_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    src_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = 60
-    cap.release()
-
-    # Target: 9:16 portrait aspect ratio (matching the UI)
-    target_width = 1080
-    target_height = 1920
-    target_aspect = target_width / target_height  # 0.5625
-
-    print(f"[BOT] Source video: {src_width}x{src_height}, Target: {target_width}x{target_height} (9:16 portrait)", flush=True)
 
     # Create video source and track with portrait dimensions
-    video_source = rtc.VideoSource(width=target_width, height=target_height)
+    video_source = rtc.VideoSource(width=TARGET_WIDTH, height=TARGET_HEIGHT)
     video_track = rtc.LocalVideoTrack.create_video_track("bot_camera", video_source)
 
     # Publish the video track
     options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_CAMERA)
     await room.local_participant.publish_track(video_track, options)
-    print(f"[BOT] Video track published: {video_path.name} @ {fps:.1f}fps -> {target_width}x{target_height}", flush=True)
+    print(f"[BOT] Video track published from shared broadcaster: video{video_index} @ {FPS}fps -> {TARGET_WIDTH}x{TARGET_HEIGHT} (I420)", flush=True)
 
-    frame_interval = 1 / fps
+    frame_interval = 1 / FPS
 
-    def crop_and_resize_to_portrait(frame):
-        """Crop center and resize frame to 9:16 portrait aspect ratio."""
-        h, w = frame.shape[:2]
-        src_aspect = w / h
-
-        if src_aspect > target_aspect:
-            # Source is wider - crop sides
-            new_w = int(h * target_aspect)
-            start_x = (w - new_w) // 2
-            cropped = frame[:, start_x : start_x + new_w]
-        else:
-            # Source is taller - crop top/bottom
-            new_h = int(w / target_aspect)
-            start_y = (h - new_h) // 2
-            cropped = frame[start_y : start_y + new_h, :]
-
-        # Resize to target dimensions
-        resized = cv2.resize(cropped, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
-        return resized
-
-    # Loop video continuously
-    while True:
-        cap = cv2.VideoCapture(str(video_path))
+    try:
         while True:
-            ret, frame = cap.read()
-            if not ret:
-                # End of video, restart from beginning
-                break
-
-            # Crop and resize to 9:16 portrait
-            frame_portrait = crop_and_resize_to_portrait(frame)
-
-            # Convert BGR (OpenCV) to RGB (LiveKit)
-            frame_rgb = cv2.cvtColor(frame_portrait, cv2.COLOR_BGR2RGB)
-
-            video_frame = rtc.VideoFrame(
-                width=target_width,
-                height=target_height,
-                type=rtc.VideoBufferType.RGB24,
-                data=frame_rgb.tobytes(),
-            )
-            video_source.capture_frame(video_frame)
+            frame_bytes = frame_reader.get_frame_bytes()
+            if frame_bytes:
+                # Use I420 format - more efficient, less CPU for encoding
+                video_frame = rtc.VideoFrame(
+                    width=TARGET_WIDTH,
+                    height=TARGET_HEIGHT,
+                    type=rtc.VideoBufferType.I420,
+                    data=frame_bytes,
+                )
+                video_source.capture_frame(video_frame)
             await asyncio.sleep(frame_interval)
-
-        cap.release()
-        print(f"[BOT] Video looped, restarting...", flush=True)
+    finally:
+        frame_reader.close()
 
 
 

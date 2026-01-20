@@ -14,6 +14,11 @@ import sys
 import os
 import signal
 
+# Video indices used by bots
+FEMALE_VIDEOS = [1, 2, 4]
+MALE_VIDEO = 3
+ALL_VIDEO_INDICES = list(set(FEMALE_VIDEOS + [MALE_VIDEO]))
+
 
 def get_user_id_for_bot(bot_number: int) -> str:
     """Generate dummy user ID for a bot.
@@ -33,11 +38,25 @@ def parse_args():
     )
     parser.add_argument(
         "-i", "--interval",
-        type=int,
-        default=10,
-        help="Seconds between spawning each bot (default: 10)"
+        type=float,
+        default=1,
+        help="Seconds between spawning each bot (default: 1)"
     )
     return parser.parse_args()
+
+
+def start_video_broadcasters():
+    """Start shared video broadcaster processes for all video files."""
+    from video_broadcaster import start_broadcaster
+
+    print(f"[{time.strftime('%H:%M:%S')}] Starting video broadcasters for videos: {ALL_VIDEO_INDICES}", flush=True)
+    for video_index in ALL_VIDEO_INDICES:
+        start_broadcaster(video_index)
+
+    # Give broadcasters time to initialize shared memory
+    print(f"[{time.strftime('%H:%M:%S')}] Waiting for broadcasters to initialize...", flush=True)
+    time.sleep(2)
+    print(f"[{time.strftime('%H:%M:%S')}] Video broadcasters ready.", flush=True)
 
 
 def main():
@@ -50,6 +69,9 @@ def main():
 
     print(f"Will spawn {total_bots} bots with {spawn_interval}s intervals.", flush=True)
     print("Press Ctrl+C to stop all bots.\n", flush=True)
+
+    # Start shared video broadcasters (one per video file)
+    start_video_broadcasters()
 
     processes = []
 
@@ -105,6 +127,11 @@ def main():
         # Wait for all to finish
         for proc in processes:
             proc.wait()
+
+        # Stop video broadcasters
+        from video_broadcaster import stop_all_broadcasters
+        print(f"[{time.strftime('%H:%M:%S')}] Stopping video broadcasters...", flush=True)
+        stop_all_broadcasters()
 
         print(f"[{time.strftime('%H:%M:%S')}] All bots stopped.", flush=True)
 
