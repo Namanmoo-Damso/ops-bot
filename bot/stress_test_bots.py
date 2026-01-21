@@ -57,14 +57,31 @@ def parse_args():
         action="store_true",
         help="Use only 1 shared video (video 1) for all bots to reduce broadcaster CPU"
     )
+    parser.add_argument(
+        "-s", "--start",
+        type=int,
+        default=1,
+        help="Starting bot number (default: 1)"
+    )
+    parser.add_argument(
+        "-v", "--video",
+        type=int,
+        choices=[1, 2, 3, 4],
+        default=None,
+        help="Force specific video index (1-4) for all bots"
+    )
     return parser.parse_args()
 
 
-def start_video_broadcasters(single_video: bool = False):
+def start_video_broadcasters(single_video: bool = False, video_index: int | None = None):
     """Start shared video broadcaster processes for all video files."""
     from video_broadcaster import start_broadcaster
 
-    if single_video:
+    if video_index is not None:
+        # Start only the specified video broadcaster
+        video_indices = [video_index]
+        print(f"[{time.strftime('%H:%M:%S')}] Starting video broadcaster for video {video_index} only", flush=True)
+    elif single_video:
         # Only start broadcaster for video 1 (all bots will use it)
         video_indices = [1]
         print(f"[{time.strftime('%H:%M:%S')}] Starting SINGLE video broadcaster (video 1 only)", flush=True)
@@ -72,8 +89,8 @@ def start_video_broadcasters(single_video: bool = False):
         video_indices = ALL_VIDEO_INDICES
         print(f"[{time.strftime('%H:%M:%S')}] Starting video broadcasters for videos: {video_indices}", flush=True)
     
-    for video_index in video_indices:
-        start_broadcaster(video_index)
+    for idx in video_indices:
+        start_broadcaster(idx)
 
     # Give broadcasters time to initialize shared memory
     print(f"[{time.strftime('%H:%M:%S')}] Waiting for broadcasters to initialize...", flush=True)
@@ -84,27 +101,28 @@ def start_video_broadcasters(single_video: bool = False):
 def main():
     args = parse_args()
     total_bots = args.num_bots
+    start_bot = args.start
     spawn_interval = args.interval
     enable_monitor = args.monitor
 
     # Ensure we are in the correct directory
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
-    print(f"Will spawn {total_bots} bots with {spawn_interval}s intervals.", flush=True)
+    print(f"Will spawn {total_bots} bots (starting from {start_bot}) with {spawn_interval}s intervals.", flush=True)
     if args.no_video:
         print("Video disabled (--no-video mode).", flush=True)
     print("Press Ctrl+C to stop all bots.\n", flush=True)
 
     # Start shared video broadcasters (one per video file) - skip if no-video mode
     if not args.no_video:
-        start_video_broadcasters(single_video=args.single_video)
+        start_video_broadcasters(single_video=args.single_video, video_index=args.video)
 
     processes = []
 
     try:
-        for i in range(1, total_bots + 1):
+        for i in range(start_bot, start_bot + total_bots):
             user_id = get_user_id_for_bot(i)
-            print(f"[{time.strftime('%H:%M:%S')}] Starting bot {i}/{total_bots} (userId={user_id})...", flush=True)
+            print(f"[{time.strftime('%H:%M:%S')}] Starting bot {i} ({i - start_bot + 1}/{total_bots}) (userId={user_id})...", flush=True)
             # Pass bot number and user ID as environment variables
             bot_env = os.environ.copy()
             bot_env["BOT_NUMBER"] = str(i)
@@ -113,6 +131,8 @@ def main():
                 bot_env["NO_VIDEO"] = "1"
             if args.single_video:
                 bot_env["SINGLE_VIDEO"] = "1"
+            if args.video:
+                bot_env["VIDEO_INDEX"] = str(args.video)
             proc = subprocess.Popen(
                 [sys.executable, "bot_client.py"],
                 # Let bot output go to console

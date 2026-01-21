@@ -52,6 +52,11 @@ def get_video_for_bot(bot_number: int) -> int:
     Returns:
         video_index (1, 2, 3, or 4)
     """
+    # If specific video is set via env var, use it
+    video_override = os.getenv("VIDEO_INDEX")
+    if video_override:
+        return int(video_override)
+    
     # If single video mode, always use video 1
     if os.getenv("SINGLE_VIDEO"):
         return 1
