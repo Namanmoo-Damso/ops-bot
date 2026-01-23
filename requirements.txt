@@ -20,3 +20,14 @@ opencv-python-headless>=4.8.0
 
 # Process monitoring for stress tests
 psutil>=5.9.0
+
+# Audio file processing (for pre-recorded voice files)
+pydub>=0.25.0
+
+# FFmpeg binaries for audio conversion
+imageio-ffmpeg>=0.5.1
+
+# Numerical processing (for waveform visualization)
+numpy>=1.24.0
+
+matplotlib
