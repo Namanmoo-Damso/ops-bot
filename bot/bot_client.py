@@ -1,29 +1,49 @@
 """Bot client that creates a bot room via the ops-api and joins it as a
-LiveKit participant. This bot can both SPEAK (TTS) and LISTEN (STT) to
-have two-way conversations with the simple_agent.
+LiveKit participant. This bot LISTENS (VAD) and SPEAKS (pre-recorded audio)
+to have two-way conversations with the simple_agent.
 
-Run this in the agents container or on a machine that can reach the
-ops-api and LiveKit server.
+Includes video stream with audio waveform visualization.
+Uses pre-recorded voice files and VAD for speech detection (no STT).
 """
 
 import asyncio
+import io
 import logging
 import os
+import random
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import httpx
+import imageio_ffmpeg
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for rendering
+import matplotlib.pyplot as plt
+import numpy as np
 from dotenv import load_dotenv
 from livekit import rtc
-from livekit.agents import AgentSession, RoomInputOptions, RoomOutputOptions
-from livekit.agents.stt import SpeechEventType
 from livekit.agents.vad import VADEventType
-from livekit.plugins import aws, silero
+from livekit.plugins import silero
 
+# Video settings for waveform visualization
+VIDEO_WIDTH = 960
+VIDEO_HEIGHT = 300
+VIDEO_FPS = 60
+NUM_BARS = 96  # Fewer bars for smaller width
+BACKGROUND_COLOR = (0, 0, 0, 255)  # Black
+
+
+# Add parent directory (bot/) to path to import config
+BOT_DIR = Path(__file__).parent  # ops-bot/
+sys.path.insert(0, str(BOT_DIR))
 from config import ConfigError, get_optional_config, validate_env_vars
 
 
 # Global shared VAD model - loaded once, reused by all bots in this process
 _shared_vad: silero.VAD | None = None
+
 
 def get_shared_vad() -> silero.VAD:
     """Get or create shared VAD model (saves ~50MB per bot)."""
@@ -37,50 +57,13 @@ def get_shared_vad() -> silero.VAD:
     return _shared_vad
 
 
-# Female video indices (1, 2, 4) and male video index (3)
-FEMALE_VIDEOS = [1, 2, 4]
-MALE_VIDEO = 3
-
-
-def get_video_for_bot(bot_number: int) -> int:
-    """Get video index for a bot based on its number.
-    
-    Bot 1-25: Female (randomly picks from videos 1, 2, 4)
-    Bot 26-50: Male (video 3)
-    Cycles every 50 bots.
-    
-    Returns:
-        video_index (1, 2, 3, or 4)
-    """
-    # If specific video is set via env var, use it
-    video_override = os.getenv("VIDEO_INDEX")
-    if video_override:
-        return int(video_override)
-    
-    # If single video mode, always use video 1
-    if os.getenv("SINGLE_VIDEO"):
-        return 1
-    
-    import random
-    # Use bot_number as seed for reproducibility
-    rng = random.Random(bot_number)
-    
-    # Cycle every 50 bots: 1-25 female, 26-50 male
-    position = ((bot_number - 1) % 50) + 1
-    
-    if position <= 25:
-        # Female - randomly pick from videos 1, 2, 4
-        return rng.choice(FEMALE_VIDEOS)
-    else:
-        # Male - video 3
-        return MALE_VIDEO
-
-
-# Load environment variables from ../.env if present
-# Load environment variables
-env_path = Path(__file__).parent / ".env"
+# Load environment variables from bot/.env
+env_path = BOT_DIR / ".env"
 if not env_path.exists():
-    env_path = Path(__file__).parent.parent / ".env"
+    # Fallback: check in ops-bot root
+    env_path = BOT_DIR.parent / ".env"
+print(f"[DEBUG] Loading .env from: {env_path}", flush=True)
+print(f"[DEBUG] .env exists: {env_path.exists()}", flush=True)
 load_dotenv(dotenv_path=env_path)
 
 
@@ -102,6 +85,190 @@ logger = logging.getLogger(__name__)
 logging.getLogger("livekit").setLevel(logging.WARNING)
 logging.getLogger("root").setLevel(logging.WARNING)
 
+# Voice files directory
+VOICE_DIR = Path(__file__).parent.parent / "voice"
+
+
+def pre_render_visualization(pcm_data: bytes, sample_rate: int = 24000) -> list[np.ndarray]:
+    """Pre-render visualization frames for audio data using matplotlib for smooth rendering.
+
+    Args:
+        pcm_data: Raw PCM audio bytes (16-bit signed, mono)
+        sample_rate: Audio sample rate
+
+    Returns:
+        List of RGBA frame arrays (one per video frame)
+    """
+    samples = np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32) / 32768.0
+    total_samples = len(samples)
+    audio_duration = total_samples / sample_rate
+    num_video_frames = int(audio_duration * VIDEO_FPS)
+
+    frames = []
+
+    # State for smooth bar animation
+    bar_values = np.zeros(NUM_BARS, dtype=np.float32)
+
+    # Pre-compute figure settings
+    dpi = 100
+    fig_width = VIDEO_WIDTH / dpi
+    fig_height = VIDEO_HEIGHT / dpi
+
+    for frame_idx in range(num_video_frames):
+        # Use floating point for precise sample positioning across full audio
+        frame_progress = frame_idx / max(num_video_frames - 1, 1)  # 0.0 to 1.0
+        center_sample = int(frame_progress * (total_samples - 1))
+        
+        # Get audio chunk around this position (window size for analysis)
+        window_size = sample_rate // VIDEO_FPS * 2  # 2 frames worth of samples
+        start_sample = max(0, center_sample - window_size // 2)
+        end_sample = min(total_samples, center_sample + window_size // 2)
+        chunk = samples[start_sample:end_sample]
+
+        # Get amplitude for each bar with amplification
+        if len(chunk) > 0:
+            chunk_per_bar = max(1, len(chunk) // NUM_BARS)
+            bar_targets = np.zeros(NUM_BARS, dtype=np.float32)
+
+            for i in range(NUM_BARS):
+                start_idx = i * chunk_per_bar
+                end_idx = min(start_idx + chunk_per_bar, len(chunk))
+                if start_idx < len(chunk):
+                    bar_chunk = chunk[start_idx:end_idx]
+                    # Use RMS with amplification
+                    rms = np.sqrt(np.mean(bar_chunk ** 2))
+                    bar_targets[i] = min(1.0, rms * 5.0)  # 5x amplification, capped at 1.0
+
+            # Smooth transitions - fast attack, slower decay
+            for i in range(NUM_BARS):
+                if bar_targets[i] > bar_values[i]:
+                    bar_values[i] = bar_values[i] * 0.3 + bar_targets[i] * 0.7  # Smooth attack
+                else:
+                    bar_values[i] = bar_values[i] * 0.9 + bar_targets[i] * 0.1  # Slower decay
+
+        # Create matplotlib figure with black background
+        fig, ax = plt.subplots(figsize=(fig_width, fig_height), dpi=dpi)
+        fig.patch.set_facecolor('black')
+        ax.set_facecolor('black')
+        
+        # Remove axes - bars grow upward from bottom (baseline at 0.2)
+        ax.set_xlim(0, NUM_BARS)
+        ax.set_ylim(0, 1)
+        ax.axis('off')
+        
+        # Draw white bars growing upward from baseline (0.2)
+        x_positions = np.arange(NUM_BARS) + 0.5  # Center bars
+        bar_heights = bar_values.copy() * 0.6  # Reduce height (60%)
+        bar_heights = np.maximum(bar_heights, 0.02)  # Minimum height
+        
+        # Draw bars from baseline (y=0.2) growing upward
+        ax.bar(x_positions, bar_heights, bottom=0.2, width=1.0,  # width=1.0 for no gaps
+               color='white', edgecolor='white', linewidth=0)
+        
+        # Render to numpy array
+        fig.tight_layout(pad=0)
+        buf = io.BytesIO()
+        fig.savefig(buf, format='rgba', dpi=dpi, facecolor='black', 
+                    edgecolor='none', bbox_inches='tight', pad_inches=0)
+        buf.seek(0)
+        
+        # Read RGBA data
+        frame_data = np.frombuffer(buf.getvalue(), dtype=np.uint8)
+        # Calculate expected size and reshape
+        frame_rgba = frame_data.reshape(-1, 4)
+        
+        # Get actual rendered size from figure
+        fig.canvas.draw()
+        width, height = fig.canvas.get_width_height()
+        
+        plt.close(fig)
+        buf.close()
+        
+        # Re-render with exact dimensions
+        fig, ax = plt.subplots(figsize=(fig_width, fig_height), dpi=dpi)
+        fig.patch.set_facecolor('black')
+        ax.set_facecolor('black')
+        ax.set_xlim(0, NUM_BARS)
+        ax.set_ylim(0, 1)
+        ax.axis('off')
+        ax.bar(x_positions, bar_heights, bottom=0.2, width=1.0,  # width=1.0 for no gaps
+               color='white', edgecolor='white', linewidth=0)
+        
+        fig.canvas.draw()
+        frame_array = np.array(fig.canvas.renderer.buffer_rgba())
+        plt.close(fig)
+        
+        # Resize to exact VIDEO_WIDTH x VIDEO_HEIGHT if needed
+        if frame_array.shape[0] != VIDEO_HEIGHT or frame_array.shape[1] != VIDEO_WIDTH:
+            from PIL import Image
+            img = Image.fromarray(frame_array)
+            img = img.resize((VIDEO_WIDTH, VIDEO_HEIGHT), Image.Resampling.LANCZOS)
+            frame_array = np.array(img)
+        
+        frames.append(frame_array)
+
+    return frames
+
+
+def generate_idle_frame() -> np.ndarray:
+    """Generate a static idle frame (no audio playing) using matplotlib."""
+    dpi = 100
+    fig_width = VIDEO_WIDTH / dpi
+    fig_height = VIDEO_HEIGHT / dpi
+    
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height), dpi=dpi)
+    fig.patch.set_facecolor('black')
+    ax.set_facecolor('black')
+    ax.set_xlim(0, NUM_BARS)
+    ax.set_ylim(0, 1)
+    ax.axis('off')
+    
+    # Draw small idle bars at baseline (0.2)
+    x_positions = np.arange(NUM_BARS) + 0.5
+    bar_heights = np.full(NUM_BARS, 0.02)  # Small constant height
+    
+    ax.bar(x_positions, bar_heights, bottom=0.2, width=1.0,  # width=1.0 for no gaps
+           color='white', edgecolor='white', linewidth=0)
+    
+    fig.canvas.draw()
+    frame_array = np.array(fig.canvas.renderer.buffer_rgba())
+    plt.close(fig)
+    
+    # Resize to exact VIDEO_WIDTH x VIDEO_HEIGHT if needed
+    if frame_array.shape[0] != VIDEO_HEIGHT or frame_array.shape[1] != VIDEO_WIDTH:
+        from PIL import Image
+        img = Image.fromarray(frame_array)
+        img = img.resize((VIDEO_WIDTH, VIDEO_HEIGHT), Image.Resampling.LANCZOS)
+        frame_array = np.array(img)
+    
+    return frame_array
+
+
+def load_voice_file(file_path: Path) -> tuple[bytes, int]:
+    """Load an MP3 file and convert to raw PCM audio data.
+
+    Returns:
+        Tuple of (raw PCM bytes, sample rate)
+    """
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    # Convert MP3 to raw PCM: mono, 24kHz, 16-bit signed little-endian
+    cmd = [
+        ffmpeg_exe,
+        "-i",
+        str(file_path),
+        "-f",
+        "s16le",  # 16-bit signed little-endian PCM
+        "-acodec",
+        "pcm_s16le",
+        "-ar",
+        "24000",  # 24kHz sample rate
+        "-ac",
+        "1",  # mono
+        "-",  # output to stdout
+    ]
+    result = subprocess.run(cmd, capture_output=True, check=True)
+    return result.stdout, 24000
+
 
 async def create_bot_session(
     bot_number: int | None = None,
@@ -109,7 +276,7 @@ async def create_bot_session(
     bot_id: str | None = None,
 ) -> dict:
     """Call ops-api /bot/create to create a bot room and token.
-    
+
     Args:
         bot_number: If provided, sets preferredIdentity to "bot-{bot_number}".
         user_id: If provided, uses the real user's identity (e.g., "kakao_123456").
@@ -136,7 +303,7 @@ async def create_bot_session(
     url = f"{api_base}/v1/bot/create"
     print(f"[DEBUG] POST {url}", flush=True)
     print(f"[DEBUG] Body: {body}", flush=True)
-    
+
     async with httpx.AsyncClient() as client:
         resp = await client.post(url, json=body, headers=headers)
         print(f"[DEBUG] Response status: {resp.status_code}", flush=True)
@@ -145,140 +312,50 @@ async def create_bot_session(
 
 
 class SimpleBotAgent:
-    """Simple bot agent that responds to agent's speech."""
+    """Simple bot agent that responds to agent's speech using pre-recorded voice files."""
 
     def __init__(self):
         self.conversation_count = 0
-        # Elderly Korean speech patterns with informal/반말 style
-        # Covers: greetings, health, daily life, emotions, family, weather, food, memories
-        self.responses = [
-            # 일상 인사/안부 응답
-            "응, 그래 그래. 요즘 허리가 좀 아프긴 해도 잘 지내고 있어.",
-            "아이고, 덕분에 잘 지내지. 고마워.",
-            "뭐, 그럭저럭 살고 있어. 하루하루가 다 비슷하지 뭐.",
-            "응, 오늘은 좀 괜찮아. 어제보다 낫네.",
+        # Load preprocessed voice files (fast) or fall back to live processing (slow)
+        self.voice_data: list[tuple[bytes, list[np.ndarray]]] = []
+        
+        # Try to load from preprocessed directory first
+        preprocessed_dir = Path(__file__).parent.parent / "voice_preprocessed"
+        
+        for i in range(1, 6):  # voice_1 to voice_5
+            npz_file = preprocessed_dir / f"voice_{i}.npz"
+            mp3_file = VOICE_DIR / f"voice_{i}.mp3"
             
-            # 건강 관련 응답
-            "아이고, 그러게 말이야. 나이 먹으니까 여기저기 안 아픈 데가 없어.",
-            "무릎이 좀 시큰시큰해. 비가 오려나 봐.",
-            "오늘은 혈압이 좀 높은 것 같아. 조심해야겠어.",
-            "허리가 아파서 오래 못 앉아 있겠어.",
-            "눈이 침침해서 글씨가 잘 안 보여.",
-            "아이고, 다리에 힘이 없어서 오래 못 걸어.",
-            "요즘 잠을 잘 못 자. 새벽에 자꾸 깨.",
-            
-            # 식사/음식 관련 응답
-            "밥은 먹었어? 끼니는 잘 챙겨 먹어야 해.",
-            "오늘 아침에 죽 끓여 먹었어. 속이 편하더라고.",
-            "점심은 된장찌개 끓여 먹었어. 맛있었어.",
-            "배가 좀 고프네... 뭐 먹을까.",
-            "요즘은 입맛이 없어서 많이 못 먹어.",
-            "옛날에는 밥을 세 공기씩 먹었는데, 이제는 반 공기도 힘들어.",
-            
-            # 귀가 어두움/다시 말해달라
-            "뭐라고? 아, 그래그래. 요즘 귀가 좀 어두워져서 말이야.",
-            "뭐라고 했어? 좀 크게 말해줘.",
-            "아, 그래? 뭐라고? 다시 한번 말해봐.",
-            "귀가 어두워서... 천천히 다시 말해줄래?",
-            
-            # 감사/긍정 응답
-            "그래, 고맙다 고마워. 젊은 사람이 이렇게 챙겨주니 좋구만.",
-            "아이고, 고마워라. 네가 말 걸어주니까 덜 외롭네.",
-            "그래그래, 좋아. 고맙다.",
-            "참 착하구나. 이렇게 신경 써줘서 고마워.",
-            
-            # 옛날 이야기/추억
-            "옛날에는 말이야, 이런 거 없었어. 세상 참 좋아졌어.",
-            "우리 젊었을 때는 말이야, 많이 힘들었어.",
-            "내가 젊었을 때는 산에 나무하러 많이 다녔지.",
-            "옛날 생각이 나네... 그때가 좋았어.",
-            "우리 신랑이 살아있을 때는 같이 산책 많이 다녔는데...",
-            
-            # 자녀/손주 이야기
-            "아이고, 맞아 맞아. 요즘 젊은 것들은 바빠서 연락도 잘 안 해.",
-            "우리 아들이 요즘 바쁜가 봐. 전화가 안 오네.",
-            "손자가 어제 전화했어. 반갑더라고.",
-            "우리 며느리가 잘해줘. 고맙지.",
-            "손녀가 대학 갔어. 기특하지?",
-            "자식들이 다 커서 제 앞가림 하니까 다행이야.",
-            
-            # 날씨/계절 관련
-            "오늘 날씨가 좋네. 산책이라도 나가볼까.",
-            "비가 올 것 같아. 빨래 걷어야겠다.",
-            "요즘 날이 추워서 바깥에 못 나가.",
-            "봄이 오나 봐. 꽃이 피기 시작했어.",
-            
-            # 일상 활동 응답
-            "오늘 아침에 산책 좀 했어. 기분이 좋더라.",
-            "텔레비전 보고 있었어. 드라마가 재밌어.",
-            "아까 화분에 물 줬어. 꽃이 예쁘게 피었어.",
-            "이웃집 아주머니랑 얘기 좀 하고 왔어.",
-            
-            # 감정 표현
-            "아이고, 심심해. 말동무가 없으니까.",
-            "오늘은 기분이 좋아. 날씨도 좋고.",
-            "좀 우울해... 아무것도 하기 싫어.",
-            "외로울 때가 있어. 혼자 있으니까.",
-        ]
+            if npz_file.exists():
+                # Fast path: load preprocessed data
+                print(f"[BOT] Loading preprocessed {npz_file.name}...", flush=True)
+                data = np.load(npz_file, allow_pickle=True)
+                pcm_data = data["pcm_data"].tobytes()
+                video_frames = [frame for frame in data["video_frames"]]
+                self.voice_data.append((pcm_data, video_frames))
+                print(f"[BOT] Loaded {npz_file.name}: {len(video_frames)} video frames", flush=True)
+            elif mp3_file.exists():
+                # Slow path: process on the fly
+                print(f"[BOT] Preprocessed file not found, processing {mp3_file.name}...", flush=True)
+                pcm_data, sample_rate = load_voice_file(mp3_file)
+                print(f"[BOT] Pre-rendering visualization for {mp3_file.name}...", flush=True)
+                video_frames = pre_render_visualization(pcm_data, sample_rate)
+                self.voice_data.append((pcm_data, video_frames))
+                print(f"[BOT] Loaded {mp3_file.name}: {len(video_frames)} video frames", flush=True)
+            else:
+                print(f"[BOT] Warning: Voice file not found: voice_{i}", flush=True)
+        
+        if not self.voice_data:
+            print("[BOT] Warning: No voice files loaded!", flush=True)
 
-    def get_response(self, agent_said: str) -> str:
-        """Get a simple response based on conversation count."""
-        response = self.responses[self.conversation_count % len(self.responses)]
+    def get_voice_response(self) -> tuple[bytes, list[np.ndarray]] | None:
+        """Get a random pre-recorded voice response with video frames."""
+        if not self.voice_data:
+            return None
         self.conversation_count += 1
-        print(f"[BOT] Response: {response}", flush=True)
-        return response
-
-
-async def publish_video_from_file(room: rtc.Room, bot_number: int):
-    """Publish video frames from shared memory broadcaster using I420 format."""
-    from video_broadcaster import SharedFrameReader, TARGET_WIDTH, TARGET_HEIGHT, FPS
-
-    video_index = get_video_for_bot(bot_number)
-
-    # Connect to shared frame broadcaster
-    frame_reader = SharedFrameReader(video_index)
-    if not frame_reader.connect(max_retries=30, retry_delay=1.0):
-        print(f"[BOT] ERROR: Could not connect to video broadcaster for video {video_index}", flush=True)
-        return
-
-    # Create video source and track with portrait dimensions
-    video_source = rtc.VideoSource(width=TARGET_WIDTH, height=TARGET_HEIGHT)
-    video_track = rtc.LocalVideoTrack.create_video_track("bot_camera", video_source)
-
-    # Publish the video track
-    options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_CAMERA)
-    await room.local_participant.publish_track(video_track, options)
-    print(f"[BOT] Video track published from shared broadcaster: video{video_index} @ {FPS}fps -> {TARGET_WIDTH}x{TARGET_HEIGHT} (I420)", flush=True)
-
-    frame_interval = 1 / FPS
-    next_frame_time = asyncio.get_event_loop().time()
-
-    try:
-        while True:
-            current_time = asyncio.get_event_loop().time()
-            
-            # Skip frames if we're behind schedule (prevents CPU buildup)
-            if current_time < next_frame_time:
-                await asyncio.sleep(next_frame_time - current_time)
-            
-            frame_bytes = frame_reader.get_frame_bytes()
-            if frame_bytes:
-                video_frame = rtc.VideoFrame(
-                    width=TARGET_WIDTH,
-                    height=TARGET_HEIGHT,
-                    type=rtc.VideoBufferType.I420,
-                    data=frame_bytes,
-                )
-                video_source.capture_frame(video_frame)
-            
-            next_frame_time += frame_interval
-            
-            # If we're way behind, reset timing (prevents runaway catch-up)
-            if current_time - next_frame_time > 1.0:
-                next_frame_time = current_time + frame_interval
-    finally:
-        frame_reader.close()
-
+        voice_index = random.randint(0, len(self.voice_data) - 1)
+        print(f"[BOT] Playing voice_{voice_index + 1}.mp3", flush=True)
+        return self.voice_data[voice_index]
 
 
 async def run_bot() -> None:
@@ -296,22 +373,22 @@ async def run_bot() -> None:
         room_name = bot_session["roomName"]
         position = bot_session.get("position", "?")
         print(f"[BOT] Queued at position {position}, polling...", flush=True)
-        
+
         async with httpx.AsyncClient() as client:
             while True:
                 retry_after = bot_session.get("retryAfter", 5)
                 await asyncio.sleep(retry_after)
-                
+
                 queue_resp = await client.get(
                     f"{api_base}/v1/rtc/queue/{identity}",
-                    params={"roomName": room_name}
+                    params={"roomName": room_name},
                 )
                 bot_session = queue_resp.json()
-                
+
                 if bot_session.get("status") == "ready":
                     print(f"[BOT] Queue cleared, got token!", flush=True)
                     break
-                    
+
                 new_position = bot_session.get("position", "?")
                 print(f"[BOT] Still queued at position {new_position}", flush=True)
 
@@ -320,22 +397,26 @@ async def run_bot() -> None:
     room_name = bot_session.get("roomName") or bot_session.get("room_name")
     identity = bot_session.get("identity")
 
-    print(f"[BOT] Joined room={room_name} identity={identity}", flush=True)
+    # Load voice files BEFORE connecting (so we don't miss agent's first words)
+    bot_agent = SimpleBotAgent()
+
+    # Initialize VAD (shared globally to save memory) - no STT needed
+    vad = get_shared_vad()
+
+    print(f"[BOT] Joining room={room_name} identity={identity}", flush=True)
+    print(f"[BOT] LiveKit URL: {livekit_url}", flush=True)
 
     # Step 2: connect to LiveKit as the bot-* participant
     room = rtc.Room()
     await room.connect(livekit_url, token)
 
-    # Initialize STT, TTS (VAD is shared globally to save memory)
-    stt = aws.STT(language="ko-KR")
-    tts = aws.TTS(voice="Seoyeon", sample_rate=24000)
-    vad = get_shared_vad()  # Reuse shared model instead of loading new one
-
-    bot_agent = SimpleBotAgent()
-
     # Create audio source and track for publishing bot's voice
     audio_source = rtc.AudioSource(24000, 1)
     audio_track = rtc.LocalAudioTrack.create_audio_track("bot_voice", audio_source)
+
+    # Create video source and track for waveform visualization
+    video_source = rtc.VideoSource(VIDEO_WIDTH, VIDEO_HEIGHT)
+    video_track = rtc.LocalVideoTrack.create_video_track("bot_waveform", video_source)
 
     # Lock to prevent concurrent speaking
     speak_lock = asyncio.Lock()
@@ -343,96 +424,161 @@ async def run_bot() -> None:
     is_speaking = False
     # Flag to track if initial greeting has been sent
     initial_greeting_sent = False
+    # Current video frame to display (None = idle frame)
+    current_video_frame: np.ndarray | None = None
+    # Pre-generate idle frame
+    idle_frame = generate_idle_frame()
+    # Flag to control video loop
+    video_running = True
 
-    # Helper function to speak via TTS
-    async def speak(text: str):
-        """Synthesize and play TTS audio."""
-        nonlocal is_speaking
+    # Background task to continuously send video frames
+    async def video_loop():
+        """Continuously send video frames (idle or from pre-rendered queue)."""
+        frame_interval = 1.0 / VIDEO_FPS
+        while video_running:
+            frame = current_video_frame if current_video_frame is not None else idle_frame
+            video_frame = rtc.VideoFrame(
+                width=VIDEO_WIDTH,
+                height=VIDEO_HEIGHT,
+                type=rtc.VideoBufferType.RGBA,
+                data=frame.tobytes(),
+            )
+            video_source.capture_frame(video_frame)
+            await asyncio.sleep(frame_interval)
+
+    # Helper function to play pre-recorded audio with pre-rendered video
+    async def speak(pcm_data: bytes, video_frames: list[np.ndarray]):
+        """Play pre-recorded PCM audio with pre-rendered visualization."""
+        nonlocal is_speaking, current_video_frame
+
         async with speak_lock:
             is_speaking = True
-            # Silenced speaking log
-            audio_stream = tts.synthesize(text)
-            async for synthesized_audio in audio_stream:
-                await audio_source.capture_frame(synthesized_audio.frame)
-            # Silenced finished speaking log
-            # Wait a bit for audio to finish playing before resuming STT
-            await asyncio.sleep(0.5)
+
+            # Audio frame settings
+            frame_size = 480  # 20ms at 24kHz
+            bytes_per_frame = frame_size * 2  # 16-bit = 2 bytes per sample
+
+            audio_duration = len(pcm_data) / (24000 * 2)  # seconds
+            
+            # Video sync task - updates video frames based on elapsed time
+            video_sync_running = True
+            video_start_time = None
+            
+            async def video_sync_task():
+                nonlocal current_video_frame, video_start_time
+                while video_sync_running:
+                    if video_start_time is not None:
+                        elapsed = time.time() - video_start_time
+                        # Add ~0.5s delay to account for audio buffering/network latency
+                        adjusted_elapsed = max(0, elapsed - 0.5)
+                        video_progress = min(adjusted_elapsed / audio_duration, 1.0)
+                        video_idx = min(int(video_progress * len(video_frames)), len(video_frames) - 1)
+                        current_video_frame = video_frames[video_idx]
+                    await asyncio.sleep(1.0 / VIDEO_FPS)  # Update at video FPS
+            
+            # Start video sync task
+            sync_task = asyncio.create_task(video_sync_task())
+            
+            # Mark start time when audio begins
+            video_start_time = time.time()
+
+            # Push all audio frames as fast as possible
+            for i in range(0, len(pcm_data), bytes_per_frame):
+                chunk = pcm_data[i : i + bytes_per_frame]
+                if len(chunk) < bytes_per_frame:
+                    chunk = chunk + b"\x00" * (bytes_per_frame - len(chunk))
+
+                frame = rtc.AudioFrame(
+                    data=chunk,
+                    sample_rate=24000,
+                    num_channels=1,
+                    samples_per_channel=frame_size,
+                )
+                await audio_source.capture_frame(frame)
+
+            # Wait for audio to finish playing (including network buffer time)
+            elapsed = time.time() - video_start_time
+            remaining = (audio_duration + 0.5) - elapsed  # Add 0.5s for buffer
+            if remaining > 0:
+                await asyncio.sleep(remaining + 0.3)
+            else:
+                await asyncio.sleep(0.3)
+
+            # Stop video sync and return to idle frame
+            video_sync_running = False
+            sync_task.cancel()
+            try:
+                await sync_task
+            except asyncio.CancelledError:
+                pass
+            
+            current_video_frame = None
             is_speaking = False
 
     async def process_audio_track(track: rtc.Track, participant: rtc.RemoteParticipant):
-        """Process incoming audio track with STT."""
-        # Silenced verbose audio processing log
-
+        """Process incoming audio track with VAD to detect when agent stops speaking."""
         audio_stream = rtc.AudioStream(track)
-        stt_stream = stt.stream()
-        frame_count = 0
+        vad_stream = vad.stream()
         
-        # Accumulated text and response task for debounce
-        accumulated_text = []
+        # Track speech state
+        agent_is_speaking = False
         response_task = None
-
-        # Task to read transcripts with debounce
-        async def read_transcripts():
-            nonlocal initial_greeting_sent, response_task
+        
+        async def delayed_response():
+            """Wait for confirmed silence, then respond."""
+            nonlocal initial_greeting_sent
             
-            async def delayed_response():
-                """Wait for silence, then wait for TTS to finish playing, then respond."""
-                await asyncio.sleep(2.0)  # Wait 2 seconds of silence (no new transcripts)
-                if accumulated_text and not is_speaking:
-                    full_text = " ".join(accumulated_text)
-                    accumulated_text.clear()
-                    
-                    # Estimate TTS playback duration: ~100ms per character for Korean
-                    estimated_tts_duration = len(full_text) * 0.1
-                    print(f"[BOT] Agent finished generating: {full_text}", flush=True)
-                    print(f"[BOT] Waiting {estimated_tts_duration:.1f}s for TTS playback to finish...", flush=True)
-                    await asyncio.sleep(estimated_tts_duration)
-                    
-                    nonlocal initial_greeting_sent
-                    if not initial_greeting_sent:
-                        initial_greeting_sent = True
-                        print(f"[BOT] bot {bot_number} 시작", flush=True)
-                    
-                    # Wait 3 seconds to allow data packets to reach web UI
-                    await asyncio.sleep(3)
-                    
-                    response = bot_agent.get_response(full_text)
-                    await speak(response)
+            await asyncio.sleep(1.5)  # Wait 1.5 seconds of silence
             
-            try:
-                async for event in stt_stream:
-                    if event.type == SpeechEventType.FINAL_TRANSCRIPT and event.alternatives:
-                        transcript = event.alternatives[0].text
-                        if transcript and transcript.strip():
-                            print(f"[BOT] Agent said: {transcript}", flush=True)
-                            accumulated_text.append(transcript.strip())
-                            
-                            # Cancel previous timer and start new one
-                            if response_task and not response_task.done():
-                                response_task.cancel()
-                            response_task = asyncio.create_task(delayed_response())
-            except Exception as e:
-                logger.error(f"Error in transcript reader: {e}", exc_info=True)
-
-        transcript_task = asyncio.create_task(read_transcripts())
-
-        # Feed audio to STT
+            if not is_speaking:
+                print(f"[BOT] Agent finished speaking (VAD detected silence)", flush=True)
+                
+                if not initial_greeting_sent:
+                    initial_greeting_sent = True
+                    print(f"[BOT] bot {bot_number} 시작", flush=True)
+                
+                # Small delay before responding
+                await asyncio.sleep(0.5)
+                
+                voice_response = bot_agent.get_voice_response()
+                if voice_response:
+                    pcm_data, video_frames = voice_response
+                    await speak(pcm_data, video_frames)
+        
+        async def process_vad_events():
+            nonlocal agent_is_speaking, response_task
+            
+            async for event in vad_stream:
+                if event.type == VADEventType.START_OF_SPEECH:
+                    agent_is_speaking = True
+                    # Cancel any pending response if agent starts speaking again
+                    if response_task and not response_task.done():
+                        response_task.cancel()
+                    print(f"[BOT] Agent started speaking", flush=True)
+                    
+                elif event.type == VADEventType.END_OF_SPEECH:
+                    agent_is_speaking = False
+                    # Only respond if bot is not currently speaking
+                    if not is_speaking:
+                        response_task = asyncio.create_task(delayed_response())
+        
+        vad_task = asyncio.create_task(process_vad_events())
+        
+        # Feed audio to VAD
         try:
             async for frame_event in audio_stream:
-                frame_count += 1
                 if not is_speaking:
-                    stt_stream.push_frame(frame_event.frame)
+                    vad_stream.push_frame(frame_event.frame)
         except Exception as e:
             logger.error(f"Error reading audio stream: {e}")
-
-        await stt_stream.aclose()
-        await transcript_task
+        
+        vad_stream.end_input()
+        await vad_task
 
     # Track active audio processing tasks
     active_audio_tasks: dict[str, asyncio.Task] = {}
 
     # Track subscription handler - listen to agent's audio
-    # IMPORTANT: Register BEFORE publishing our track so we catch all subscriptions
     @room.on("track_subscribed")
     def on_track_subscribed(
         track: rtc.Track,
@@ -458,9 +604,16 @@ async def run_bot() -> None:
     def on_participant_connected(participant: rtc.RemoteParticipant):
         pass  # Silenced participant connected log
 
-    # Publish the track immediately so agent can hear us
-    options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
-    publication = await room.local_participant.publish_track(audio_track, options)
+    # Publish audio track
+    audio_options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
+    await room.local_participant.publish_track(audio_track, audio_options)
+
+    # Publish video track for waveform visualization
+    video_options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_CAMERA)
+    await room.local_participant.publish_track(video_track, video_options)
+
+    # Start video loop for continuous waveform rendering
+    video_task = asyncio.create_task(video_loop())
 
     # Wait for agent to join
     await asyncio.sleep(2)
@@ -471,26 +624,28 @@ async def run_bot() -> None:
             agent_identity = p.identity
         # Check for existing audio tracks from this participant
         for sid, track_pub in p.track_publications.items():
-            if track_pub.kind == rtc.TrackKind.KIND_AUDIO and p.identity.startswith("agent-"):
+            if track_pub.kind == rtc.TrackKind.KIND_AUDIO and p.identity.startswith(
+                "agent-"
+            ):
                 if track_pub.track:
                     task_key = f"{p.identity}_{sid}"
                     if task_key not in active_audio_tasks:
-                        task = asyncio.create_task(process_audio_track(track_pub.track, p))
+                        task = asyncio.create_task(
+                            process_audio_track(track_pub.track, p)
+                        )
                         active_audio_tasks[task_key] = task
 
-    print(f"[BOT] Ready and listening for agent speech...", flush=True)
-
-    # Start video publishing in background (unless disabled)
-    video_task = None
-    if not os.getenv("NO_VIDEO"):
-        video_task = asyncio.create_task(publish_video_from_file(room, bot_number))
-    else:
-        print(f"[BOT] Video disabled (NO_VIDEO=1)", flush=True)
+    print(
+        f"[BOT] Ready and listening for agent speech (using pre-recorded voice files)...",
+        flush=True,
+    )
 
     # Keep the bot connected until interrupted
     try:
         await asyncio.Event().wait()
     finally:
+        video_running = False
+        video_task.cancel()
         await room.disconnect()
 
 

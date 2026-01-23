@@ -22,9 +22,6 @@ def validate_env_vars() -> dict[str, str]:
     required_vars = [
         "OPS_API_URL",
         "ADMIN_ACCESS_TOKEN",
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_DEFAULT_REGION",
     ]
 
     missing_vars = []
@@ -43,13 +40,6 @@ def validate_env_vars() -> dict[str, str]:
             f"Please set these variables in your .env file or environment."
         )
         raise ConfigError(error_msg)
-
-    # Validate AWS credentials format (basic check)
-    aws_key = config["AWS_ACCESS_KEY_ID"]
-    if not aws_key.startswith("AKIA"):
-        raise ConfigError(
-            "AWS_ACCESS_KEY_ID appears invalid (should start with 'AKIA')"
-        )
 
     return config
 
